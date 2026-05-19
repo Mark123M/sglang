@@ -29,25 +29,34 @@ export HF_TOKEN=hf_...
 
 ```bash
 python3 -m py_compile scripts/modal/diffusion_dev.py
-.venv/bin/modal run scripts/modal/diffusion_dev.py::generate --help
-.venv/bin/modal run scripts/modal/diffusion_dev.py::bench_serving --help
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench --help
 .venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate --help
 ```
 
-```bash
-.venv/bin/modal run scripts/modal/diffusion_dev.py::generate \
-  --source local \
-  --label smoke \
-  --height 512 \
-  --width 512 \
-  --num-inference-steps 2
-```
+## What's Enabled By Default
+
+Every `production_bench` run uses a single max-efficiency preset on the H100
+80GB target:
+
+- `--enable-torch-compile` and `--warmup --warmup-resolutions <workload res>`
+  so the first request does not pay compile cost.
+- `--attention-backend fa` (FlashAttention; lossless).
+- `--batching-mode dynamic` with per-workload `--batching-max-size` and
+  `--batching-delay-ms` (Z-Image-Turbo `8/5ms`, Qwen-Image `4/10ms`,
+  FLUX.1-dev `2/10ms`).
+- VBench prompts, SLO scoring, warmup requests, and a Poisson arrival sweep at
+  concurrency `1,2,4,8`.
+- Cache-DiT env knobs (`SGLANG_CACHE_DIT_ENABLED=true` plus conservative
+  `FN/BN/WARMUP/RDT/MC` defaults). This is the one lossy optimization in the
+  preset; pass `--enable-cache-dit false` for a fully lossless run.
+
+DiT and VAE offloads stay off because the target GPU has the VRAM headroom and
+copy overlap is unreliable on T2I image models.
 
 ## Dry Run The Production Commands
 
-Use this first to print the exact `sglang serve` and diffusion `bench_serving`
-commands without launching the remote benchmark.
+Prints the exact `sglang serve` and `bench_serving` commands the preset will
+launch, without running anything remote.
 
 ```bash
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
@@ -58,10 +67,6 @@ commands without launching the remote benchmark.
 ```
 
 ## Realistic Text-To-Image Workloads
-
-The production benchmark uses SGLang's diffusion serving benchmark with VBench
-prompts, warmup requests, SLO scoring, and a concurrency sweep. By default it
-uses Poisson arrivals and concurrency `1,2,4,8`.
 
 ### Qwen-Image
 
@@ -105,7 +110,7 @@ export RUN_ID="zimage-turbo-t2i-$(date -u +%Y%m%d-%H%M%S)"
 ## Baseline Vs Candidate
 
 Use the same run ID for the baked Docker image baseline and the local checkout
-candidate. This keeps artifacts together while isolating source changes.
+candidate. Artifacts land together so a side-by-side diff is trivial.
 
 ```bash
 export RUN_ID="qwen-image-compare-$(date -u +%Y%m%d-%H%M%S)"
@@ -129,165 +134,66 @@ export RUN_ID="qwen-image-compare-$(date -u +%Y%m%d-%H%M%S)"
   --num-prompts 80
 ```
 
-## Traffic Shapes
+## Cache-DiT Off (Lossless Baseline)
 
-### Poisson Arrivals
-
-This is the default production-style traffic shape.
+Cache-DiT is on by default for throughput. Disable it when comparing against a
+known-good lossless baseline or measuring quality.
 
 ```bash
-export RUN_ID="qwen-poisson-$(date -u +%Y%m%d-%H%M%S)"
+export RUN_ID="qwen-image-no-cache-dit-$(date -u +%Y%m%d-%H%M%S)"
 
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
   --source local \
   --run-id "$RUN_ID" \
-  --label poisson \
+  --label no-cache-dit \
   --workload qwen-image-t2i-prod \
-  --traffic poisson \
-  --request-rate auto \
+  --enable-cache-dit false \
   --num-prompts 80
 ```
 
-### Burst Arrivals
+Tune Cache-DiT aggressively (lossier, faster) by setting the env knobs through
+`--serve-extra-args` is not currently supported; override the workload's
+`cache_dit_env` in `scripts/modal/diffusion_dev.py` if you need different
+thresholds.
 
-Use this to stress scheduler behavior by sending each concurrency tier as fast
-as the benchmark can issue requests.
+## Overrides
+
+The preset is opinionated. Reach for `--serve-extra-args` and
+`--bench-extra-args` when you need to override it for one run.
 
 ```bash
-export RUN_ID="qwen-burst-$(date -u +%Y%m%d-%H%M%S)"
-
+# Burst traffic instead of Poisson.
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label burst \
-  --workload qwen-image-t2i-prod \
-  --traffic burst \
-  --num-prompts 80
+  --source local --workload qwen-image-t2i-prod --num-prompts 80 \
+  --traffic burst
 ```
 
-### Fixed Request Rate
-
 ```bash
-export RUN_ID="qwen-fixed-rate-$(date -u +%Y%m%d-%H%M%S)"
-
+# Wider concurrency sweep.
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label fixed-rate \
-  --workload qwen-image-t2i-prod \
-  --traffic poisson \
-  --request-rate 0.2 \
-  --num-prompts 80
+  --source local --workload qwen-image-t2i-prod --num-prompts 160 \
+  --concurrency 1,2,4,8,16
 ```
 
-## Concurrency Sweeps
-
 ```bash
-export RUN_ID="qwen-concurrency-$(date -u +%Y%m%d-%H%M%S)"
-
+# Per-tier scheduler batch metrics.
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label c1-c16 \
-  --workload qwen-image-t2i-prod \
-  --concurrency 1,2,4,8,16 \
-  --num-prompts 160
-```
-
-## Dynamic Batching Experiments
-
-The default production benchmark leaves scheduler metrics and extra logging off
-to avoid perturbing the run. Enable dynamic batching explicitly when testing it.
-
-```bash
-export RUN_ID="qwen-dynamic-batching-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label dynbatch \
-  --workload qwen-image-t2i-prod \
-  --concurrency 1,2,4,8,16 \
-  --num-prompts 160 \
-  --enable-dynamic-batching \
-  --batching-max-size 8 \
-  --batching-delay-ms 5
-```
-
-Add scheduler batch logs only when you want those logs more than a clean timing
-run:
-
-```bash
-export RUN_ID="qwen-dynamic-batching-metrics-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label dynbatch-metrics \
-  --workload qwen-image-t2i-prod \
-  --concurrency 1,2,4,8,16 \
-  --num-prompts 160 \
-  --enable-dynamic-batching \
-  --batching-max-size 8 \
-  --batching-delay-ms 5 \
+  --source local --workload qwen-image-t2i-prod --num-prompts 80 \
   --serve-extra-args "--enable-batching-metrics"
 ```
 
-## Override Resolution, Steps, Or Model
-
 ```bash
-export RUN_ID="qwen-768-steps-$(date -u +%Y%m%d-%H%M%S)"
-
+# Resolution / steps / model override.
 .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label qwen-768-30steps \
-  --workload qwen-image-t2i-prod \
-  --height 768 \
-  --width 768 \
-  --num-inference-steps 30 \
-  --num-prompts 80
-```
-
-```bash
-export RUN_ID="custom-t2i-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label custom-model \
-  --workload qwen-image-t2i-prod \
-  --model-path Qwen/Qwen-Image \
-  --height 1024 \
-  --width 1024 \
-  --num-inference-steps 20 \
-  --num-prompts 80
-```
-
-## Low-Level Serving Smoke Test
-
-Use this only when you want a single serving benchmark run instead of the
-production sweep.
-
-```bash
-export RUN_ID="qwen-serving-smoke-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::bench_serving \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label serving \
-  --num-prompts 4 \
-  --max-concurrency 1 \
-  --height 1024 \
-  --width 1024 \
-  --num-inference-steps 20 \
-  --bench-extra-args "--dataset vbench --slo --disable-tqdm"
+  --source local --workload qwen-image-t2i-prod --num-prompts 80 \
+  --model-path Qwen/Qwen-Image --height 768 --width 768 \
+  --num-inference-steps 30
 ```
 
 ## Profiling Around A Benchmark
 
-Use profiling after the production benchmark identifies a workload worth
-inspecting. Profiling is intentionally separate from production timing runs.
+Profiling is intentionally separate from production timing runs. Use it after
+the benchmark identifies a workload worth inspecting.
 
 ### PyTorch Profiler, Denoising Stage
 

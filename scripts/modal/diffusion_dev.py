@@ -3,10 +3,8 @@
 
 Examples:
 
-  .venv/bin/modal run scripts/modal/diffusion_dev.py::generate --source image --label baseline
-  .venv/bin/modal run scripts/modal/diffusion_dev.py::generate --source local --label candidate
-  .venv/bin/modal run scripts/modal/diffusion_dev.py::bench_serving --source local --num-prompts 1 --max-concurrency 1
   .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench --source local --num-prompts 20
+  .venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate --source local --label denoise
 """
 
 from __future__ import annotations
@@ -41,6 +39,15 @@ HF_CACHE_PATH = Path("/cache/huggingface")
 SGLANG_CACHE_PATH = Path("/cache/sglang")
 SGLANG_DIFFUSION_CACHE_PATH = SGLANG_CACHE_PATH / "sgl_diffusion"
 
+DEFAULT_CACHE_DIT_ENV = {
+    "SGLANG_CACHE_DIT_ENABLED": "true",
+    "SGLANG_CACHE_DIT_FN": "1",
+    "SGLANG_CACHE_DIT_BN": "0",
+    "SGLANG_CACHE_DIT_WARMUP": "4",
+    "SGLANG_CACHE_DIT_RDT": "0.24",
+    "SGLANG_CACHE_DIT_MC": "3",
+}
+
 T2I_WORKLOADS = {
     "qwen-image-t2i-prod": {
         "model_path": "Qwen/Qwen-Image",
@@ -49,6 +56,11 @@ T2I_WORKLOADS = {
         "num_inference_steps": 20,
         "concurrency": DEFAULT_PROD_CONCURRENCY,
         "latency_hint_s": 20.0,
+        "warmup_resolutions": "1024x1024",
+        "attention_backend": "fa",
+        "batching_max_size": 4,
+        "batching_delay_ms": 10.0,
+        "cache_dit_env": dict(DEFAULT_CACHE_DIT_ENV),
     },
     "flux1-dev-t2i-prod": {
         "model_path": "black-forest-labs/FLUX.1-dev",
@@ -57,6 +69,11 @@ T2I_WORKLOADS = {
         "num_inference_steps": 28,
         "concurrency": DEFAULT_PROD_CONCURRENCY,
         "latency_hint_s": 50.0,
+        "warmup_resolutions": "1024x1024",
+        "attention_backend": "fa",
+        "batching_max_size": 2,
+        "batching_delay_ms": 10.0,
+        "cache_dit_env": dict(DEFAULT_CACHE_DIT_ENV),
     },
     "zimage-turbo-t2i-prod": {
         "model_path": "Tongyi-MAI/Z-Image-Turbo",
@@ -65,6 +82,11 @@ T2I_WORKLOADS = {
         "num_inference_steps": 8,
         "concurrency": DEFAULT_PROD_CONCURRENCY,
         "latency_hint_s": 2.0,
+        "warmup_resolutions": "1024x1024",
+        "attention_backend": "fa",
+        "batching_max_size": 8,
+        "batching_delay_ms": 5.0,
+        "cache_dit_env": dict(DEFAULT_CACHE_DIT_ENV),
     },
 }
 
@@ -263,6 +285,8 @@ def _resolve_t2i_workload(
             f"unknown workload {workload!r}; choose one of {sorted(T2I_WORKLOADS)}"
         )
     cfg = dict(T2I_WORKLOADS[workload])
+    if "cache_dit_env" in cfg:
+        cfg["cache_dit_env"] = dict(cfg["cache_dit_env"])
     if model_path:
         cfg["model_path"] = model_path
     if height > 0:
@@ -282,14 +306,25 @@ def _has_arg(args: list[str], name: str) -> bool:
     return any(arg == name or arg.startswith(f"{name}=") for arg in args)
 
 
+def _apply_cache_dit_env(
+    env: dict[str, str], cache_dit_env: dict[str, str] | None
+) -> None:
+    if not cache_dit_env:
+        return
+    for key, value in cache_dit_env.items():
+        # Caller-set values win so a user-provided env override is honored.
+        env.setdefault(key, str(value))
+
+
 def _build_production_server_cmd(
     *,
     model_path: str,
     port: int,
-    serve_extra_args: str,
-    enable_dynamic_batching: bool,
+    warmup_resolutions: str,
+    attention_backend: str,
     batching_max_size: int,
     batching_delay_ms: float,
+    serve_extra_args: str,
 ) -> list[str]:
     extra = shlex.split(serve_extra_args) if serve_extra_args else []
     cmd = [
@@ -304,11 +339,18 @@ def _build_production_server_cmd(
     ]
     if not _has_arg(extra, "--warmup"):
         cmd.append("--warmup")
-    if enable_dynamic_batching:
-        if not _has_arg(extra, "--batching-max-size"):
-            cmd.extend(["--batching-max-size", str(batching_max_size)])
-        if not _has_arg(extra, "--batching-delay-ms"):
-            cmd.extend(["--batching-delay-ms", str(batching_delay_ms)])
+    if warmup_resolutions and not _has_arg(extra, "--warmup-resolutions"):
+        cmd.extend(["--warmup-resolutions", warmup_resolutions])
+    if not _has_arg(extra, "--enable-torch-compile"):
+        cmd.append("--enable-torch-compile")
+    if attention_backend and not _has_arg(extra, "--attention-backend"):
+        cmd.extend(["--attention-backend", attention_backend])
+    if not _has_arg(extra, "--batching-mode"):
+        cmd.extend(["--batching-mode", "dynamic"])
+    if not _has_arg(extra, "--batching-max-size"):
+        cmd.extend(["--batching-max-size", str(batching_max_size)])
+    if not _has_arg(extra, "--batching-delay-ms"):
+        cmd.extend(["--batching-delay-ms", str(batching_delay_ms)])
     cmd.extend(extra)
     return cmd
 
@@ -434,9 +476,7 @@ def _production_dry_run(
     warmup_requests: int = 1,
     serve_extra_args: str = "",
     bench_extra_args: str = "",
-    enable_dynamic_batching: bool = False,
-    batching_max_size: int = 8,
-    batching_delay_ms: float = 5.0,
+    enable_cache_dit: bool = True,
 ) -> dict:
     cfg = _resolve_t2i_workload(
         workload,
@@ -449,11 +489,13 @@ def _production_dry_run(
     server_cmd = _build_production_server_cmd(
         model_path=cfg["model_path"],
         port=port,
+        warmup_resolutions=str(cfg.get("warmup_resolutions", "")),
+        attention_backend=str(cfg.get("attention_backend", "")),
+        batching_max_size=int(cfg["batching_max_size"]),
+        batching_delay_ms=float(cfg["batching_delay_ms"]),
         serve_extra_args=serve_extra_args,
-        enable_dynamic_batching=enable_dynamic_batching,
-        batching_max_size=batching_max_size,
-        batching_delay_ms=batching_delay_ms,
     )
+    cache_dit_env = dict(cfg.get("cache_dit_env") or {}) if enable_cache_dit else {}
     bench_cmds = []
     for conc in cfg["concurrency_values"]:
         rate = _production_request_rate(
@@ -477,178 +519,12 @@ def _production_dry_run(
                 bench_extra_args=bench_extra_args,
             )
         )
-    return {"workload": cfg, "server_cmd": server_cmd, "bench_cmds": bench_cmds}
-
-
-@app.function(**REMOTE_OPTIONS)
-def _generate_remote(
-    source: str,
-    label: str,
-    run_id: str,
-    model_path: str,
-    prompt: str,
-    height: int,
-    width: int,
-    num_inference_steps: int,
-    seed: int,
-    extra_args: str,
-) -> dict[str, str]:
-    cwd, env = _source_env(source)
-    run_dir = _run_dir(run_id)
-    label = _slug(label)
-
-    output_dir = run_dir / "outputs" / label
-    output_dir.mkdir(parents=True, exist_ok=True)
-    perf_path = run_dir / f"{label}.json"
-
-    cmd = [
-        "sglang",
-        "generate",
-        "--model-path",
-        model_path,
-        "--prompt",
-        prompt,
-        "--seed",
-        str(seed),
-        "--height",
-        str(height),
-        "--width",
-        str(width),
-        "--num-inference-steps",
-        str(num_inference_steps),
-        "--save-output",
-        "--output-path",
-        str(output_dir),
-        "--output-file-name",
-        label,
-        "--perf-dump-path",
-        str(perf_path),
-    ]
-    if extra_args:
-        cmd.extend(shlex.split(extra_args))
-
-    try:
-        _run(cmd, cwd=cwd, env=env, log_path=run_dir / "logs" / f"{label}.generate.log")
-        return {
-            "run_id": run_dir.name,
-            "source": source,
-            "label": label,
-            "perf_path": str(perf_path),
-            "output_dir": str(output_dir),
-            "log_path": str(run_dir / "logs" / f"{label}.generate.log"),
-        }
-    finally:
-        _commit_volumes()
-
-
-@app.function(**REMOTE_OPTIONS)
-def _bench_serving_remote(
-    source: str,
-    label: str,
-    run_id: str,
-    model_path: str,
-    num_prompts: int,
-    max_concurrency: int,
-    port: int,
-    height: int,
-    width: int,
-    num_inference_steps: int,
-    server_timeout_seconds: int,
-    serve_extra_args: str,
-    bench_extra_args: str,
-) -> dict[str, str]:
-    cwd, env = _source_env(source)
-    run_dir = _run_dir(run_id)
-    label = _slug(label)
-
-    server_log_path = run_dir / "logs" / f"{label}.server.log"
-    output_path = run_dir / f"{label}.serving.jsonl"
-    server_cmd = [
-        "sglang",
-        "serve",
-        "--model-path",
-        model_path,
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(port),
-    ]
-    if serve_extra_args:
-        server_cmd.extend(shlex.split(serve_extra_args))
-
-    print(f"$ {shlex.join(server_cmd)}")
-    print(f"cwd={cwd}")
-    server_log = server_log_path.open("w", encoding="utf-8")
-    server_log.write(f"$ {shlex.join(server_cmd)}\n")
-    server_log.write(f"cwd={cwd}\n")
-    server_log.flush()
-    server_process = subprocess.Popen(
-        server_cmd,
-        cwd=str(cwd),
-        env=env,
-        stdout=server_log,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    try:
-        _wait_for_health(
-            f"http://127.0.0.1:{port}/health",
-            process=server_process,
-            timeout_seconds=server_timeout_seconds,
-            server_log_path=server_log_path,
-        )
-
-        bench_cmd = [
-            "python",
-            "-m",
-            "sglang.multimodal_gen.benchmarks.bench_serving",
-            "--model",
-            model_path,
-            "--task",
-            "text-to-image",
-            "--num-prompts",
-            str(num_prompts),
-            "--max-concurrency",
-            str(max_concurrency),
-            "--port",
-            str(port),
-            "--output-file",
-            str(output_path),
-        ]
-        if height > 0:
-            bench_cmd.extend(["--height", str(height)])
-        if width > 0:
-            bench_cmd.extend(["--width", str(width)])
-        if num_inference_steps > 0:
-            bench_cmd.extend(["--num-inference-steps", str(num_inference_steps)])
-        if bench_extra_args:
-            bench_cmd.extend(shlex.split(bench_extra_args))
-
-        _run(
-            bench_cmd,
-            cwd=cwd,
-            env=env,
-            log_path=run_dir / "logs" / f"{label}.bench_serving.log",
-        )
-        return {
-            "run_id": run_dir.name,
-            "source": source,
-            "label": label,
-            "output_path": str(output_path),
-            "server_log_path": str(server_log_path),
-            "bench_log_path": str(run_dir / "logs" / f"{label}.bench_serving.log"),
-        }
-    finally:
-        if server_process.poll() is None:
-            server_process.terminate()
-            try:
-                server_process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                server_process.kill()
-                server_process.wait(timeout=30)
-        server_log.close()
-        _commit_volumes()
+    return {
+        "workload": cfg,
+        "server_cmd": server_cmd,
+        "bench_cmds": bench_cmds,
+        "cache_dit_env": cache_dit_env,
+    }
 
 
 @app.function(**REMOTE_OPTIONS)
@@ -670,9 +546,7 @@ def _production_bench_remote(
     server_timeout_seconds: int,
     serve_extra_args: str,
     bench_extra_args: str,
-    enable_dynamic_batching: bool,
-    batching_max_size: int,
-    batching_delay_ms: float,
+    enable_cache_dit: bool,
 ) -> dict[str, object]:
     cwd, env = _source_env(source)
     run_dir = _run_dir(run_id)
@@ -685,15 +559,18 @@ def _production_bench_remote(
         num_inference_steps=num_inference_steps,
         concurrency=concurrency,
     )
+    if enable_cache_dit:
+        _apply_cache_dit_env(env, cfg.get("cache_dit_env"))
 
     server_log_path = run_dir / "logs" / f"{label}.server.log"
     server_cmd = _build_production_server_cmd(
         model_path=cfg["model_path"],
         port=port,
+        warmup_resolutions=str(cfg.get("warmup_resolutions", "")),
+        attention_backend=str(cfg.get("attention_backend", "")),
+        batching_max_size=int(cfg["batching_max_size"]),
+        batching_delay_ms=float(cfg["batching_delay_ms"]),
         serve_extra_args=serve_extra_args,
-        enable_dynamic_batching=enable_dynamic_batching,
-        batching_max_size=batching_max_size,
-        batching_delay_ms=batching_delay_ms,
     )
 
     print(f"$ {shlex.join(server_cmd)}")
@@ -868,70 +745,6 @@ def _profile_generate_remote(
 
 
 @app.local_entrypoint()
-def generate(
-    source: str = "local",
-    label: str = "candidate",
-    run_id: str = "",
-    model_path: str = DEFAULT_MODEL,
-    prompt: str = DEFAULT_PROMPT,
-    height: int = 1024,
-    width: int = 1024,
-    num_inference_steps: int = 20,
-    seed: int = 0,
-    extra_args: str = "",
-) -> None:
-    """Run one-off `sglang generate` and write perf/output artifacts to /runs."""
-    result = _generate_remote.remote(
-        source,
-        label,
-        run_id or _new_run_id(label, source),
-        model_path,
-        prompt,
-        height,
-        width,
-        num_inference_steps,
-        seed,
-        extra_args,
-    )
-    print(json.dumps(result, indent=2, sort_keys=True))
-
-
-@app.local_entrypoint()
-def bench_serving(
-    source: str = "local",
-    label: str = "serving",
-    run_id: str = "",
-    model_path: str = DEFAULT_MODEL,
-    num_prompts: int = 1,
-    max_concurrency: int = 1,
-    port: int = DEFAULT_PORT,
-    height: int = 1024,
-    width: int = 1024,
-    num_inference_steps: int = 20,
-    server_timeout_seconds: int = 1800,
-    serve_extra_args: str = "",
-    bench_extra_args: str = "",
-) -> None:
-    """Run `sglang serve` plus diffusion `bench_serving` on one Modal GPU."""
-    result = _bench_serving_remote.remote(
-        source,
-        label,
-        run_id or _new_run_id(label, source),
-        model_path,
-        num_prompts,
-        max_concurrency,
-        port,
-        height,
-        width,
-        num_inference_steps,
-        server_timeout_seconds,
-        serve_extra_args,
-        bench_extra_args,
-    )
-    print(json.dumps(result, indent=2, sort_keys=True))
-
-
-@app.local_entrypoint()
 def production_bench(
     source: str = "local",
     label: str = "prod",
@@ -950,12 +763,10 @@ def production_bench(
     server_timeout_seconds: int = 1800,
     serve_extra_args: str = "",
     bench_extra_args: str = "",
-    enable_dynamic_batching: bool = False,
-    batching_max_size: int = 8,
-    batching_delay_ms: float = 5.0,
+    enable_cache_dit: bool = True,
     dry_run: bool = False,
 ) -> None:
-    """Run a T2I production-style serving sweep and write reports under /runs."""
+    """Run a T2I production-style serving sweep at max model efficiency."""
     if dry_run:
         result = _production_dry_run(
             workload=workload,
@@ -971,9 +782,7 @@ def production_bench(
             warmup_requests=warmup_requests,
             serve_extra_args=serve_extra_args,
             bench_extra_args=bench_extra_args,
-            enable_dynamic_batching=enable_dynamic_batching,
-            batching_max_size=batching_max_size,
-            batching_delay_ms=batching_delay_ms,
+            enable_cache_dit=enable_cache_dit,
         )
     else:
         result = _production_bench_remote.remote(
@@ -994,9 +803,7 @@ def production_bench(
             server_timeout_seconds,
             serve_extra_args,
             bench_extra_args,
-            enable_dynamic_batching,
-            batching_max_size,
-            batching_delay_ms,
+            enable_cache_dit,
         )
     print(json.dumps(result, indent=2, sort_keys=True))
 

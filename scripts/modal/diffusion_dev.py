@@ -6,6 +6,7 @@ Examples:
   .venv/bin/modal run scripts/modal/diffusion_dev.py::generate --source image --label baseline
   .venv/bin/modal run scripts/modal/diffusion_dev.py::generate --source local --label candidate
   .venv/bin/modal run scripts/modal/diffusion_dev.py::bench_serving --source local --num-prompts 1 --max-concurrency 1
+  .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench --source local --num-prompts 20
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ DEFAULT_MODEL = "Qwen/Qwen-Image"
 DEFAULT_PROMPT = "A logo With Bold Large text: SGL Diffusion"
 DEFAULT_PORT = 30010
 REMOTE_TIMEOUT_SECONDS = 6 * 60 * 60
+DEFAULT_PROD_CONCURRENCY = "1,2,4,8"
 
 IMAGE_REPO = Path("/sgl-workspace/sglang")
 LOCAL_REPO = Path("/workspace/sglang-local")
@@ -38,6 +40,33 @@ RUNS_ROOT = Path("/runs")
 HF_CACHE_PATH = Path("/cache/huggingface")
 SGLANG_CACHE_PATH = Path("/cache/sglang")
 SGLANG_DIFFUSION_CACHE_PATH = SGLANG_CACHE_PATH / "sgl_diffusion"
+
+T2I_WORKLOADS = {
+    "qwen-image-t2i-prod": {
+        "model_path": "Qwen/Qwen-Image",
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 20,
+        "concurrency": DEFAULT_PROD_CONCURRENCY,
+        "latency_hint_s": 20.0,
+    },
+    "flux1-dev-t2i-prod": {
+        "model_path": "black-forest-labs/FLUX.1-dev",
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 28,
+        "concurrency": DEFAULT_PROD_CONCURRENCY,
+        "latency_hint_s": 50.0,
+    },
+    "zimage-turbo-t2i-prod": {
+        "model_path": "Tongyi-MAI/Z-Image-Turbo",
+        "height": 1024,
+        "width": 1024,
+        "num_inference_steps": 8,
+        "concurrency": DEFAULT_PROD_CONCURRENCY,
+        "latency_hint_s": 2.0,
+    },
+}
 
 
 def _ignore_local_path(path: Path) -> bool:
@@ -205,6 +234,250 @@ def _commit_volumes() -> None:
     runs_vol.commit()
     hf_cache_vol.commit()
     sglang_cache_vol.commit()
+
+
+def _split_csv_ints(value: str) -> list[int]:
+    out = [int(x.strip()) for x in value.split(",") if x.strip()]
+    if not out or any(x <= 0 for x in out):
+        raise ValueError(f"expected positive comma-separated integers, got {value!r}")
+    return out
+
+
+def _load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _resolve_t2i_workload(
+    workload: str,
+    *,
+    model_path: str,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    concurrency: str,
+) -> dict:
+    if workload not in T2I_WORKLOADS:
+        raise ValueError(
+            f"unknown workload {workload!r}; choose one of {sorted(T2I_WORKLOADS)}"
+        )
+    cfg = dict(T2I_WORKLOADS[workload])
+    if model_path:
+        cfg["model_path"] = model_path
+    if height > 0:
+        cfg["height"] = height
+    if width > 0:
+        cfg["width"] = width
+    if num_inference_steps > 0:
+        cfg["num_inference_steps"] = num_inference_steps
+    if concurrency:
+        cfg["concurrency"] = concurrency
+    cfg["workload"] = workload
+    cfg["concurrency_values"] = _split_csv_ints(str(cfg["concurrency"]))
+    return cfg
+
+
+def _has_arg(args: list[str], name: str) -> bool:
+    return any(arg == name or arg.startswith(f"{name}=") for arg in args)
+
+
+def _build_production_server_cmd(
+    *,
+    model_path: str,
+    port: int,
+    serve_extra_args: str,
+    enable_dynamic_batching: bool,
+    batching_max_size: int,
+    batching_delay_ms: float,
+) -> list[str]:
+    extra = shlex.split(serve_extra_args) if serve_extra_args else []
+    cmd = [
+        "sglang",
+        "serve",
+        "--model-path",
+        model_path,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(port),
+    ]
+    if not _has_arg(extra, "--warmup"):
+        cmd.append("--warmup")
+    if enable_dynamic_batching:
+        if not _has_arg(extra, "--batching-max-size"):
+            cmd.extend(["--batching-max-size", str(batching_max_size)])
+        if not _has_arg(extra, "--batching-delay-ms"):
+            cmd.extend(["--batching-delay-ms", str(batching_delay_ms)])
+    cmd.extend(extra)
+    return cmd
+
+
+def _production_request_rate(
+    *,
+    traffic: str,
+    request_rate: str,
+    concurrency: int,
+    latency_hint_s: float,
+) -> str:
+    if traffic == "burst":
+        return "inf"
+    if traffic != "poisson":
+        raise ValueError("traffic must be 'poisson' or 'burst'")
+    if request_rate != "auto":
+        return request_rate
+    return f"{max(0.01, 0.8 * concurrency / max(latency_hint_s, 0.001)):.4g}"
+
+
+def _build_production_bench_cmd(
+    *,
+    model_path: str,
+    port: int,
+    output_path: Path,
+    num_prompts: int,
+    max_concurrency: int,
+    request_rate: str,
+    warmup_requests: int,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    bench_extra_args: str,
+) -> list[str]:
+    extra = shlex.split(bench_extra_args) if bench_extra_args else []
+    cmd = [
+        "python",
+        "-m",
+        "sglang.multimodal_gen.benchmarks.bench_serving",
+        "--model",
+        model_path,
+        "--task",
+        "text-to-image",
+        "--dataset",
+        "vbench",
+        "--num-prompts",
+        str(num_prompts),
+        "--max-concurrency",
+        str(max_concurrency),
+        "--request-rate",
+        request_rate,
+        "--warmup-requests",
+        str(warmup_requests),
+        "--port",
+        str(port),
+        "--height",
+        str(height),
+        "--width",
+        str(width),
+        "--num-inference-steps",
+        str(num_inference_steps),
+        "--output-file",
+        str(output_path),
+    ]
+    if not _has_arg(extra, "--slo"):
+        cmd.append("--slo")
+    if not _has_arg(extra, "--disable-tqdm"):
+        cmd.append("--disable-tqdm")
+    cmd.extend(extra)
+    return cmd
+
+
+def _write_production_summary(
+    *, run_dir: Path, workload_cfg: dict, bench_runs: list[dict]
+) -> str:
+    benchmarks = []
+    for run in bench_runs:
+        metrics = _load_json(Path(run["output_path"]))
+        benchmarks.append(
+            {
+                "concurrency": run["concurrency"],
+                "request_rate": run["request_rate"],
+                "total_requests": run["num_prompts"],
+                "completed_requests": metrics.get("completed_requests", 0),
+                "failed_requests": metrics.get("failed_requests", 0),
+                "throughput_qps": metrics.get("throughput_qps", 0),
+                "output_throughput_ops": metrics.get("output_throughput_ops", 0),
+                "latency_p50_s": metrics.get(
+                    "latency_p50", metrics.get("latency_median", 0)
+                ),
+                "latency_p90_s": metrics.get("latency_p90", 0),
+                "latency_p95_s": metrics.get("latency_p95", 0),
+                "latency_p99_s": metrics.get("latency_p99", 0),
+                "slo_attainment_rate": metrics.get("slo_attainment_rate", 0),
+                "peak_memory_mb_max": metrics.get("peak_memory_mb_max", 0),
+                "raw_output_path": run["output_path"],
+            }
+        )
+
+    summary = {
+        "workload": workload_cfg,
+        "benchmarks": benchmarks,
+    }
+    summary_path = run_dir / "summary.json"
+    summary_path.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return str(summary_path)
+
+
+def _production_dry_run(
+    *,
+    workload: str = "qwen-image-t2i-prod",
+    model_path: str = "",
+    height: int = 0,
+    width: int = 0,
+    num_inference_steps: int = 0,
+    num_prompts: int = 20,
+    concurrency: str = DEFAULT_PROD_CONCURRENCY,
+    traffic: str = "poisson",
+    request_rate: str = "auto",
+    port: int = DEFAULT_PORT,
+    warmup_requests: int = 1,
+    serve_extra_args: str = "",
+    bench_extra_args: str = "",
+    enable_dynamic_batching: bool = False,
+    batching_max_size: int = 8,
+    batching_delay_ms: float = 5.0,
+) -> dict:
+    cfg = _resolve_t2i_workload(
+        workload,
+        model_path=model_path,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        concurrency=concurrency,
+    )
+    server_cmd = _build_production_server_cmd(
+        model_path=cfg["model_path"],
+        port=port,
+        serve_extra_args=serve_extra_args,
+        enable_dynamic_batching=enable_dynamic_batching,
+        batching_max_size=batching_max_size,
+        batching_delay_ms=batching_delay_ms,
+    )
+    bench_cmds = []
+    for conc in cfg["concurrency_values"]:
+        rate = _production_request_rate(
+            traffic=traffic,
+            request_rate=request_rate,
+            concurrency=conc,
+            latency_hint_s=float(cfg["latency_hint_s"]),
+        )
+        bench_cmds.append(
+            _build_production_bench_cmd(
+                model_path=cfg["model_path"],
+                port=port,
+                output_path=Path(f"/runs/dry-run/c{conc}.json"),
+                num_prompts=num_prompts,
+                max_concurrency=conc,
+                request_rate=rate,
+                warmup_requests=warmup_requests,
+                height=cfg["height"],
+                width=cfg["width"],
+                num_inference_steps=cfg["num_inference_steps"],
+                bench_extra_args=bench_extra_args,
+            )
+        )
+    return {"workload": cfg, "server_cmd": server_cmd, "bench_cmds": bench_cmds}
 
 
 @app.function(**REMOTE_OPTIONS)
@@ -378,6 +651,222 @@ def _bench_serving_remote(
         _commit_volumes()
 
 
+@app.function(**REMOTE_OPTIONS)
+def _production_bench_remote(
+    source: str,
+    label: str,
+    run_id: str,
+    workload: str,
+    model_path: str,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    num_prompts: int,
+    concurrency: str,
+    traffic: str,
+    request_rate: str,
+    port: int,
+    warmup_requests: int,
+    server_timeout_seconds: int,
+    serve_extra_args: str,
+    bench_extra_args: str,
+    enable_dynamic_batching: bool,
+    batching_max_size: int,
+    batching_delay_ms: float,
+) -> dict[str, object]:
+    cwd, env = _source_env(source)
+    run_dir = _run_dir(run_id)
+    label = _slug(label)
+    cfg = _resolve_t2i_workload(
+        workload,
+        model_path=model_path,
+        height=height,
+        width=width,
+        num_inference_steps=num_inference_steps,
+        concurrency=concurrency,
+    )
+
+    server_log_path = run_dir / "logs" / f"{label}.server.log"
+    server_cmd = _build_production_server_cmd(
+        model_path=cfg["model_path"],
+        port=port,
+        serve_extra_args=serve_extra_args,
+        enable_dynamic_batching=enable_dynamic_batching,
+        batching_max_size=batching_max_size,
+        batching_delay_ms=batching_delay_ms,
+    )
+
+    print(f"$ {shlex.join(server_cmd)}")
+    print(f"cwd={cwd}")
+    server_log = server_log_path.open("w", encoding="utf-8")
+    server_log.write(f"$ {shlex.join(server_cmd)}\n")
+    server_log.write(f"cwd={cwd}\n")
+    server_log.flush()
+    server_process = subprocess.Popen(
+        server_cmd,
+        cwd=str(cwd),
+        env=env,
+        stdout=server_log,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+
+    bench_runs: list[dict] = []
+    try:
+        try:
+            _wait_for_health(
+                f"http://127.0.0.1:{port}/health",
+                process=server_process,
+                timeout_seconds=server_timeout_seconds,
+                server_log_path=server_log_path,
+            )
+
+            for conc in cfg["concurrency_values"]:
+                rate = _production_request_rate(
+                    traffic=traffic,
+                    request_rate=request_rate,
+                    concurrency=conc,
+                    latency_hint_s=float(cfg["latency_hint_s"]),
+                )
+                output_path = run_dir / f"{label}.c{conc}.json"
+                bench_cmd = _build_production_bench_cmd(
+                    model_path=cfg["model_path"],
+                    port=port,
+                    output_path=output_path,
+                    num_prompts=num_prompts,
+                    max_concurrency=conc,
+                    request_rate=rate,
+                    warmup_requests=warmup_requests,
+                    height=cfg["height"],
+                    width=cfg["width"],
+                    num_inference_steps=cfg["num_inference_steps"],
+                    bench_extra_args=bench_extra_args,
+                )
+                _run(
+                    bench_cmd,
+                    cwd=cwd,
+                    env=env,
+                    log_path=run_dir / "logs" / f"{label}.c{conc}.bench.log",
+                )
+                bench_runs.append(
+                    {
+                        "concurrency": conc,
+                        "request_rate": rate,
+                        "num_prompts": num_prompts,
+                        "output_path": str(output_path),
+                    }
+                )
+        finally:
+            if server_process.poll() is None:
+                server_process.terminate()
+                try:
+                    server_process.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    server_process.kill()
+                    server_process.wait(timeout=30)
+            server_log.close()
+
+        summary_path = _write_production_summary(
+            run_dir=run_dir, workload_cfg=cfg, bench_runs=bench_runs
+        )
+        return {
+            "run_id": run_dir.name,
+            "source": source,
+            "label": label,
+            "workload": workload,
+            "bench_runs": bench_runs,
+            "artifacts": {
+                "summary": summary_path,
+                "server_log": str(server_log_path),
+            },
+        }
+    finally:
+        _commit_volumes()
+
+
+@app.function(**REMOTE_OPTIONS)
+def _profile_generate_remote(
+    source: str,
+    label: str,
+    run_id: str,
+    model_path: str,
+    prompt: str,
+    height: int,
+    width: int,
+    num_inference_steps: int,
+    seed: int,
+    profile_all_stages: bool,
+    num_profiled_timesteps: int,
+    nsys: bool,
+    extra_args: str,
+) -> dict[str, str]:
+    cwd, env = _source_env(source)
+    run_dir = _run_dir(run_id)
+    label = _slug(label)
+    output_dir = run_dir / "outputs" / label
+    output_dir.mkdir(parents=True, exist_ok=True)
+    perf_path = run_dir / f"{label}.profile.json"
+
+    cmd = [
+        "sglang",
+        "generate",
+        "--model-path",
+        model_path,
+        "--prompt",
+        prompt,
+        "--seed",
+        str(seed),
+        "--height",
+        str(height),
+        "--width",
+        str(width),
+        "--num-inference-steps",
+        str(num_inference_steps),
+        "--save-output",
+        "--output-path",
+        str(output_dir),
+        "--output-file-name",
+        label,
+        "--perf-dump-path",
+        str(perf_path),
+        "--profile",
+        "--num-profiled-timesteps",
+        str(num_profiled_timesteps),
+    ]
+    if profile_all_stages:
+        cmd.append("--profile-all-stages")
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
+    if nsys:
+        cmd = [
+            "nsys",
+            "profile",
+            "--trace-fork-before-exec=true",
+            "--cuda-graph-trace=node",
+            "--force-overwrite=true",
+            "-o",
+            str(run_dir / label),
+        ] + cmd
+
+    try:
+        _run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            log_path=run_dir / "logs" / f"{label}.profile_generate.log",
+        )
+        return {
+            "run_id": run_dir.name,
+            "source": source,
+            "label": label,
+            "perf_path": str(perf_path),
+            "output_dir": str(output_dir),
+            "log_path": str(run_dir / "logs" / f"{label}.profile_generate.log"),
+        }
+    finally:
+        _commit_volumes()
+
+
 @app.local_entrypoint()
 def generate(
     source: str = "local",
@@ -438,5 +927,110 @@ def bench_serving(
         server_timeout_seconds,
         serve_extra_args,
         bench_extra_args,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint()
+def production_bench(
+    source: str = "local",
+    label: str = "prod",
+    run_id: str = "",
+    workload: str = "qwen-image-t2i-prod",
+    model_path: str = "",
+    height: int = 0,
+    width: int = 0,
+    num_inference_steps: int = 0,
+    num_prompts: int = 20,
+    concurrency: str = DEFAULT_PROD_CONCURRENCY,
+    traffic: str = "poisson",
+    request_rate: str = "auto",
+    port: int = DEFAULT_PORT,
+    warmup_requests: int = 1,
+    server_timeout_seconds: int = 1800,
+    serve_extra_args: str = "",
+    bench_extra_args: str = "",
+    enable_dynamic_batching: bool = False,
+    batching_max_size: int = 8,
+    batching_delay_ms: float = 5.0,
+    dry_run: bool = False,
+) -> None:
+    """Run a T2I production-style serving sweep and write reports under /runs."""
+    if dry_run:
+        result = _production_dry_run(
+            workload=workload,
+            model_path=model_path,
+            height=height,
+            width=width,
+            num_inference_steps=num_inference_steps,
+            num_prompts=num_prompts,
+            concurrency=concurrency,
+            traffic=traffic,
+            request_rate=request_rate,
+            port=port,
+            warmup_requests=warmup_requests,
+            serve_extra_args=serve_extra_args,
+            bench_extra_args=bench_extra_args,
+            enable_dynamic_batching=enable_dynamic_batching,
+            batching_max_size=batching_max_size,
+            batching_delay_ms=batching_delay_ms,
+        )
+    else:
+        result = _production_bench_remote.remote(
+            source,
+            label,
+            run_id or _new_run_id(label, source),
+            workload,
+            model_path,
+            height,
+            width,
+            num_inference_steps,
+            num_prompts,
+            concurrency,
+            traffic,
+            request_rate,
+            port,
+            warmup_requests,
+            server_timeout_seconds,
+            serve_extra_args,
+            bench_extra_args,
+            enable_dynamic_batching,
+            batching_max_size,
+            batching_delay_ms,
+        )
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+@app.local_entrypoint()
+def profile_generate(
+    source: str = "local",
+    label: str = "profile",
+    run_id: str = "",
+    model_path: str = DEFAULT_MODEL,
+    prompt: str = DEFAULT_PROMPT,
+    height: int = 1024,
+    width: int = 1024,
+    num_inference_steps: int = 20,
+    seed: int = 0,
+    profile_all_stages: bool = False,
+    num_profiled_timesteps: int = 5,
+    nsys: bool = False,
+    extra_args: str = "",
+) -> None:
+    """Profile one T2I `sglang generate` run with torch profiler or Nsight."""
+    result = _profile_generate_remote.remote(
+        source,
+        label,
+        run_id or _new_run_id(label, source),
+        model_path,
+        prompt,
+        height,
+        width,
+        num_inference_steps,
+        seed,
+        profile_all_stages,
+        num_profiled_timesteps,
+        nsys,
+        extra_args,
     )
     print(json.dumps(result, indent=2, sort_keys=True))

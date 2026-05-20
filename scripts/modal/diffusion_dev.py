@@ -3,8 +3,10 @@
 
 Examples:
 
-  .venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench --source local --num-prompts 20
-  .venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate --source local --label denoise
+  .venv/bin/modal run scripts/modal/diffusion_dev.py::saturation_bench \
+    --source local --num-prompts 20
+  .venv/bin/modal run scripts/modal/diffusion_dev.py::generate_perf \
+    --source local --label new
 """
 
 from __future__ import annotations
@@ -30,7 +32,8 @@ DEFAULT_MODEL = "Qwen/Qwen-Image"
 DEFAULT_PROMPT = "A logo With Bold Large text: SGL Diffusion"
 DEFAULT_PORT = 30010
 REMOTE_TIMEOUT_SECONDS = 6 * 60 * 60
-DEFAULT_PROD_CONCURRENCY = "1,2,4,8"
+DEFAULT_SATURATION_CONCURRENCY = "1,2,4,8,16,32,64"
+DEFAULT_SATURATION_SLO_PRESET = "diffserve-sdxl-1024-15s"
 
 IMAGE_REPO = Path("/sgl-workspace/sglang")
 LOCAL_REPO = Path("/workspace/sglang-local")
@@ -54,8 +57,7 @@ T2I_WORKLOADS = {
         "height": 1024,
         "width": 1024,
         "num_inference_steps": 20,
-        "concurrency": DEFAULT_PROD_CONCURRENCY,
-        "latency_hint_s": 20.0,
+        "concurrency": DEFAULT_SATURATION_CONCURRENCY,
         "warmup_resolutions": "1024x1024",
         "attention_backend": "fa",
         "batching_max_size": 4,
@@ -67,8 +69,7 @@ T2I_WORKLOADS = {
         "height": 1024,
         "width": 1024,
         "num_inference_steps": 28,
-        "concurrency": DEFAULT_PROD_CONCURRENCY,
-        "latency_hint_s": 50.0,
+        "concurrency": DEFAULT_SATURATION_CONCURRENCY,
         "warmup_resolutions": "1024x1024",
         "attention_backend": "fa",
         "batching_max_size": 2,
@@ -80,13 +81,39 @@ T2I_WORKLOADS = {
         "height": 1024,
         "width": 1024,
         "num_inference_steps": 8,
-        "concurrency": DEFAULT_PROD_CONCURRENCY,
-        "latency_hint_s": 2.0,
+        "concurrency": DEFAULT_SATURATION_CONCURRENCY,
         "warmup_resolutions": "1024x1024",
         "attention_backend": "fa",
         "batching_max_size": 8,
         "batching_delay_ms": 5.0,
         "cache_dit_env": dict(DEFAULT_CACHE_DIT_ENV),
+    },
+}
+
+SLO_PRESETS = {
+    "genserve-image-3s": {
+        "name": "GENSERVE image SLO",
+        "fixed_slo_ms": 3000.0,
+        "source": "GENSERVE image_slo=3.0s for mixed image/video diffusion serving",
+        "modality": "image",
+    },
+    "diffserve-t2i-512-5s": {
+        "name": "DiffServe 512px T2I SLO",
+        "fixed_slo_ms": 5000.0,
+        "source": "DiffServe 512x512 SD-Turbo/SDv1.5 cascades use a 5s SLO",
+        "modality": "image",
+    },
+    "diffserve-sdxl-1024-15s": {
+        "name": "DiffServe SDXL 1024px SLO",
+        "fixed_slo_ms": 15000.0,
+        "source": "DiffServe 1024x1024 SDXL cascade uses a 15s SLO",
+        "modality": "image",
+    },
+    "genserve-video-60s": {
+        "name": "GENSERVE video SLO",
+        "fixed_slo_ms": 60000.0,
+        "source": "GENSERVE video_slo=60.0s for mixed image/video diffusion serving",
+        "modality": "video",
     },
 }
 
@@ -302,6 +329,60 @@ def _resolve_t2i_workload(
     return cfg
 
 
+def _resolve_slo_config(slo_preset: str, fixed_slo_ms: float) -> dict:
+    if fixed_slo_ms < 0:
+        raise ValueError(f"fixed_slo_ms must be non-negative, got {fixed_slo_ms}")
+
+    normalized_preset = (slo_preset or "").strip()
+    if normalized_preset.lower() in {"", "none"}:
+        normalized_preset = ""
+
+    preset_cfg = {}
+    if normalized_preset:
+        if normalized_preset not in SLO_PRESETS:
+            choices = ", ".join(sorted(SLO_PRESETS))
+            raise ValueError(
+                f"unknown SLO preset {slo_preset!r}; choose one of: {choices}, "
+                "or pass --fixed-slo-ms"
+            )
+        preset_cfg = SLO_PRESETS[normalized_preset]
+
+    if fixed_slo_ms > 0:
+        return {
+            "mode": "fixed",
+            "preset": normalized_preset or "custom-fixed-slo",
+            "name": preset_cfg.get("name", "Custom fixed SLO"),
+            "source": (
+                "CLI --fixed-slo-ms override"
+                if normalized_preset
+                else "CLI --fixed-slo-ms"
+            ),
+            "preset_source": preset_cfg.get("source", ""),
+            "modality": preset_cfg.get("modality", "image"),
+            "fixed_slo_ms": float(fixed_slo_ms),
+        }
+
+    if not normalized_preset:
+        raise ValueError("saturation_bench requires --slo-preset or --fixed-slo-ms")
+
+    return {
+        "mode": "fixed",
+        "preset": normalized_preset,
+        "name": preset_cfg["name"],
+        "source": preset_cfg["source"],
+        "preset_source": preset_cfg["source"],
+        "modality": preset_cfg["modality"],
+        "fixed_slo_ms": float(preset_cfg["fixed_slo_ms"]),
+    }
+
+
+def _fixed_slo_ms_arg(slo_config: dict) -> float | None:
+    fixed_slo_ms = slo_config.get("fixed_slo_ms")
+    if fixed_slo_ms is None:
+        return None
+    return float(fixed_slo_ms)
+
+
 def _has_arg(args: list[str], name: str) -> bool:
     return any(arg == name or arg.startswith(f"{name}=") for arg in args)
 
@@ -316,7 +397,7 @@ def _apply_cache_dit_env(
         env.setdefault(key, str(value))
 
 
-def _build_production_server_cmd(
+def _build_server_cmd(
     *,
     model_path: str,
     port: int,
@@ -355,35 +436,19 @@ def _build_production_server_cmd(
     return cmd
 
 
-def _production_request_rate(
-    *,
-    traffic: str,
-    request_rate: str,
-    concurrency: int,
-    latency_hint_s: float,
-) -> str:
-    if traffic == "burst":
-        return "inf"
-    if traffic != "poisson":
-        raise ValueError("traffic must be 'poisson' or 'burst'")
-    if request_rate != "auto":
-        return request_rate
-    return f"{max(0.01, 0.8 * concurrency / max(latency_hint_s, 0.001)):.4g}"
-
-
-def _build_production_bench_cmd(
+def _build_saturation_bench_cmd(
     *,
     model_path: str,
     port: int,
     output_path: Path,
     num_prompts: int,
     max_concurrency: int,
-    request_rate: str,
     warmup_requests: int,
     height: int,
     width: int,
     num_inference_steps: int,
     bench_extra_args: str,
+    fixed_slo_ms: float | None,
 ) -> list[str]:
     extra = shlex.split(bench_extra_args) if bench_extra_args else []
     cmd = [
@@ -401,7 +466,7 @@ def _build_production_bench_cmd(
         "--max-concurrency",
         str(max_concurrency),
         "--request-rate",
-        request_rate,
+        "inf",
         "--warmup-requests",
         str(warmup_requests),
         "--port",
@@ -417,18 +482,32 @@ def _build_production_bench_cmd(
     ]
     if not _has_arg(extra, "--slo"):
         cmd.append("--slo")
+    if fixed_slo_ms is not None and fixed_slo_ms > 0 and not _has_arg(
+        extra, "--fixed-slo-ms"
+    ):
+        cmd.extend(["--fixed-slo-ms", f"{fixed_slo_ms:g}"])
     if not _has_arg(extra, "--disable-tqdm"):
         cmd.append("--disable-tqdm")
     cmd.extend(extra)
     return cmd
 
 
-def _write_production_summary(
-    *, run_dir: Path, workload_cfg: dict, bench_runs: list[dict]
-) -> str:
+def _write_saturation_summary(
+    *,
+    run_dir: Path,
+    workload_cfg: dict,
+    bench_runs: list[dict],
+    slo_threshold: float,
+    slo_config: dict,
+) -> tuple[str, int]:
     benchmarks = []
+    max_concurrent_under_slo = 0
     for run in bench_runs:
         metrics = _load_json(Path(run["output_path"]))
+        attainment = float(metrics.get("slo_attainment_rate", 0))
+        passed = attainment >= slo_threshold
+        if passed:
+            max_concurrent_under_slo = max(max_concurrent_under_slo, run["concurrency"])
         benchmarks.append(
             {
                 "concurrency": run["concurrency"],
@@ -437,46 +516,48 @@ def _write_production_summary(
                 "completed_requests": metrics.get("completed_requests", 0),
                 "failed_requests": metrics.get("failed_requests", 0),
                 "throughput_qps": metrics.get("throughput_qps", 0),
-                "output_throughput_ops": metrics.get("output_throughput_ops", 0),
                 "latency_p50_s": metrics.get(
                     "latency_p50", metrics.get("latency_median", 0)
                 ),
-                "latency_p90_s": metrics.get("latency_p90", 0),
                 "latency_p95_s": metrics.get("latency_p95", 0),
                 "latency_p99_s": metrics.get("latency_p99", 0),
-                "slo_attainment_rate": metrics.get("slo_attainment_rate", 0),
-                "peak_memory_mb_max": metrics.get("peak_memory_mb_max", 0),
+                "slo_attainment_rate": attainment,
+                "slo_passed": passed,
+                "slo_mode": metrics.get("slo_mode", slo_config["mode"]),
+                "fixed_slo_ms": metrics.get("fixed_slo_ms", slo_config["fixed_slo_ms"]),
                 "raw_output_path": run["output_path"],
             }
         )
-
     summary = {
         "workload": workload_cfg,
+        "slo": slo_config,
+        "slo_threshold": slo_threshold,
+        "max_concurrent_under_slo": max_concurrent_under_slo,
         "benchmarks": benchmarks,
     }
     summary_path = run_dir / "summary.json"
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    return str(summary_path)
+    return str(summary_path), max_concurrent_under_slo
 
 
-def _production_dry_run(
+def _saturation_dry_run(
     *,
     workload: str = "qwen-image-t2i-prod",
     model_path: str = "",
     height: int = 0,
     width: int = 0,
     num_inference_steps: int = 0,
-    num_prompts: int = 20,
-    concurrency: str = DEFAULT_PROD_CONCURRENCY,
-    traffic: str = "poisson",
-    request_rate: str = "auto",
+    num_prompts: int = 128,
+    concurrency: str = DEFAULT_SATURATION_CONCURRENCY,
     port: int = DEFAULT_PORT,
     warmup_requests: int = 1,
     serve_extra_args: str = "",
     bench_extra_args: str = "",
     enable_cache_dit: bool = True,
+    slo_preset: str = DEFAULT_SATURATION_SLO_PRESET,
+    fixed_slo_ms: float = 0.0,
 ) -> dict:
     cfg = _resolve_t2i_workload(
         workload,
@@ -486,7 +567,8 @@ def _production_dry_run(
         num_inference_steps=num_inference_steps,
         concurrency=concurrency,
     )
-    server_cmd = _build_production_server_cmd(
+    slo_config = _resolve_slo_config(slo_preset, fixed_slo_ms)
+    server_cmd = _build_server_cmd(
         model_path=cfg["model_path"],
         port=port,
         warmup_resolutions=str(cfg.get("warmup_resolutions", "")),
@@ -498,29 +580,24 @@ def _production_dry_run(
     cache_dit_env = dict(cfg.get("cache_dit_env") or {}) if enable_cache_dit else {}
     bench_cmds = []
     for conc in cfg["concurrency_values"]:
-        rate = _production_request_rate(
-            traffic=traffic,
-            request_rate=request_rate,
-            concurrency=conc,
-            latency_hint_s=float(cfg["latency_hint_s"]),
-        )
         bench_cmds.append(
-            _build_production_bench_cmd(
+            _build_saturation_bench_cmd(
                 model_path=cfg["model_path"],
                 port=port,
                 output_path=Path(f"/runs/dry-run/c{conc}.json"),
                 num_prompts=num_prompts,
                 max_concurrency=conc,
-                request_rate=rate,
                 warmup_requests=warmup_requests,
                 height=cfg["height"],
                 width=cfg["width"],
                 num_inference_steps=cfg["num_inference_steps"],
                 bench_extra_args=bench_extra_args,
+                fixed_slo_ms=_fixed_slo_ms_arg(slo_config),
             )
         )
     return {
         "workload": cfg,
+        "slo": slo_config,
         "server_cmd": server_cmd,
         "bench_cmds": bench_cmds,
         "cache_dit_env": cache_dit_env,
@@ -528,7 +605,7 @@ def _production_dry_run(
 
 
 @app.function(**REMOTE_OPTIONS)
-def _production_bench_remote(
+def _saturation_bench_remote(
     source: str,
     label: str,
     run_id: str,
@@ -539,14 +616,16 @@ def _production_bench_remote(
     num_inference_steps: int,
     num_prompts: int,
     concurrency: str,
-    traffic: str,
-    request_rate: str,
     port: int,
     warmup_requests: int,
     server_timeout_seconds: int,
     serve_extra_args: str,
     bench_extra_args: str,
     enable_cache_dit: bool,
+    slo_threshold: float,
+    stop_on_slo_breach: bool,
+    slo_preset: str,
+    fixed_slo_ms: float,
 ) -> dict[str, object]:
     cwd, env = _source_env(source)
     run_dir = _run_dir(run_id)
@@ -559,11 +638,12 @@ def _production_bench_remote(
         num_inference_steps=num_inference_steps,
         concurrency=concurrency,
     )
+    slo_config = _resolve_slo_config(slo_preset, fixed_slo_ms)
     if enable_cache_dit:
         _apply_cache_dit_env(env, cfg.get("cache_dit_env"))
 
     server_log_path = run_dir / "logs" / f"{label}.server.log"
-    server_cmd = _build_production_server_cmd(
+    server_cmd = _build_server_cmd(
         model_path=cfg["model_path"],
         port=port,
         warmup_resolutions=str(cfg.get("warmup_resolutions", "")),
@@ -599,25 +679,19 @@ def _production_bench_remote(
             )
 
             for conc in cfg["concurrency_values"]:
-                rate = _production_request_rate(
-                    traffic=traffic,
-                    request_rate=request_rate,
-                    concurrency=conc,
-                    latency_hint_s=float(cfg["latency_hint_s"]),
-                )
                 output_path = run_dir / f"{label}.c{conc}.json"
-                bench_cmd = _build_production_bench_cmd(
+                bench_cmd = _build_saturation_bench_cmd(
                     model_path=cfg["model_path"],
                     port=port,
                     output_path=output_path,
                     num_prompts=num_prompts,
                     max_concurrency=conc,
-                    request_rate=rate,
                     warmup_requests=warmup_requests,
                     height=cfg["height"],
                     width=cfg["width"],
                     num_inference_steps=cfg["num_inference_steps"],
                     bench_extra_args=bench_extra_args,
+                    fixed_slo_ms=_fixed_slo_ms_arg(slo_config),
                 )
                 _run(
                     bench_cmd,
@@ -628,11 +702,19 @@ def _production_bench_remote(
                 bench_runs.append(
                     {
                         "concurrency": conc,
-                        "request_rate": rate,
+                        "request_rate": "inf",
                         "num_prompts": num_prompts,
                         "output_path": str(output_path),
                     }
                 )
+                metrics = _load_json(output_path)
+                attainment = float(metrics.get("slo_attainment_rate", 0))
+                if stop_on_slo_breach and attainment < slo_threshold:
+                    print(
+                        f"SLO breached at c={conc}: attainment={attainment:.3f} "
+                        f"< threshold={slo_threshold}. Stopping sweep early."
+                    )
+                    break
         finally:
             if server_process.poll() is None:
                 server_process.terminate()
@@ -643,14 +725,21 @@ def _production_bench_remote(
                     server_process.wait(timeout=30)
             server_log.close()
 
-        summary_path = _write_production_summary(
-            run_dir=run_dir, workload_cfg=cfg, bench_runs=bench_runs
+        summary_path, max_under_slo = _write_saturation_summary(
+            run_dir=run_dir,
+            workload_cfg=cfg,
+            bench_runs=bench_runs,
+            slo_threshold=slo_threshold,
+            slo_config=slo_config,
         )
         return {
             "run_id": run_dir.name,
             "source": source,
             "label": label,
             "workload": workload,
+            "slo": slo_config,
+            "slo_threshold": slo_threshold,
+            "max_concurrent_under_slo": max_under_slo,
             "bench_runs": bench_runs,
             "artifacts": {
                 "summary": summary_path,
@@ -662,7 +751,7 @@ def _production_bench_remote(
 
 
 @app.function(**REMOTE_OPTIONS)
-def _profile_generate_remote(
+def _generate_perf_remote(
     source: str,
     label: str,
     run_id: str,
@@ -672,9 +761,6 @@ def _profile_generate_remote(
     width: int,
     num_inference_steps: int,
     seed: int,
-    profile_all_stages: bool,
-    num_profiled_timesteps: int,
-    nsys: bool,
     extra_args: str,
 ) -> dict[str, str]:
     cwd, env = _source_env(source)
@@ -682,7 +768,7 @@ def _profile_generate_remote(
     label = _slug(label)
     output_dir = run_dir / "outputs" / label
     output_dir.mkdir(parents=True, exist_ok=True)
-    perf_path = run_dir / f"{label}.profile.json"
+    perf_path = run_dir / f"{label}.perf.json"
 
     cmd = [
         "sglang",
@@ -706,31 +792,16 @@ def _profile_generate_remote(
         label,
         "--perf-dump-path",
         str(perf_path),
-        "--profile",
-        "--num-profiled-timesteps",
-        str(num_profiled_timesteps),
     ]
-    if profile_all_stages:
-        cmd.append("--profile-all-stages")
     if extra_args:
         cmd.extend(shlex.split(extra_args))
-    if nsys:
-        cmd = [
-            "nsys",
-            "profile",
-            "--trace-fork-before-exec=true",
-            "--cuda-graph-trace=node",
-            "--force-overwrite=true",
-            "-o",
-            str(run_dir / label),
-        ] + cmd
 
     try:
         _run(
             cmd,
             cwd=cwd,
             env=env,
-            log_path=run_dir / "logs" / f"{label}.profile_generate.log",
+            log_path=run_dir / "logs" / f"{label}.generate_perf.log",
         )
         return {
             "run_id": run_dir.name,
@@ -738,37 +809,39 @@ def _profile_generate_remote(
             "label": label,
             "perf_path": str(perf_path),
             "output_dir": str(output_dir),
-            "log_path": str(run_dir / "logs" / f"{label}.profile_generate.log"),
+            "log_path": str(run_dir / "logs" / f"{label}.generate_perf.log"),
         }
     finally:
         _commit_volumes()
 
 
 @app.local_entrypoint()
-def production_bench(
+def saturation_bench(
     source: str = "local",
-    label: str = "prod",
+    label: str = "saturation",
     run_id: str = "",
     workload: str = "qwen-image-t2i-prod",
     model_path: str = "",
     height: int = 0,
     width: int = 0,
     num_inference_steps: int = 0,
-    num_prompts: int = 20,
-    concurrency: str = DEFAULT_PROD_CONCURRENCY,
-    traffic: str = "poisson",
-    request_rate: str = "auto",
+    num_prompts: int = 128,
+    concurrency: str = DEFAULT_SATURATION_CONCURRENCY,
     port: int = DEFAULT_PORT,
     warmup_requests: int = 1,
     server_timeout_seconds: int = 1800,
     serve_extra_args: str = "",
     bench_extra_args: str = "",
     enable_cache_dit: bool = True,
+    slo_threshold: float = 0.95,
+    stop_on_slo_breach: bool = True,
+    slo_preset: str = DEFAULT_SATURATION_SLO_PRESET,
+    fixed_slo_ms: float = 0.0,
     dry_run: bool = False,
 ) -> None:
-    """Run a T2I production-style serving sweep at max model efficiency."""
+    """Closed-loop saturation sweep: find max concurrency that holds SLO."""
     if dry_run:
-        result = _production_dry_run(
+        result = _saturation_dry_run(
             workload=workload,
             model_path=model_path,
             height=height,
@@ -776,16 +849,18 @@ def production_bench(
             num_inference_steps=num_inference_steps,
             num_prompts=num_prompts,
             concurrency=concurrency,
-            traffic=traffic,
-            request_rate=request_rate,
             port=port,
             warmup_requests=warmup_requests,
             serve_extra_args=serve_extra_args,
             bench_extra_args=bench_extra_args,
             enable_cache_dit=enable_cache_dit,
+            slo_preset=slo_preset,
+            fixed_slo_ms=fixed_slo_ms,
         )
+        result["slo_threshold"] = slo_threshold
+        result["stop_on_slo_breach"] = stop_on_slo_breach
     else:
-        result = _production_bench_remote.remote(
+        result = _saturation_bench_remote.remote(
             source,
             label,
             run_id or _new_run_id(label, source),
@@ -796,22 +871,24 @@ def production_bench(
             num_inference_steps,
             num_prompts,
             concurrency,
-            traffic,
-            request_rate,
             port,
             warmup_requests,
             server_timeout_seconds,
             serve_extra_args,
             bench_extra_args,
             enable_cache_dit,
+            slo_threshold,
+            stop_on_slo_breach,
+            slo_preset,
+            fixed_slo_ms,
         )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
 @app.local_entrypoint()
-def profile_generate(
+def generate_perf(
     source: str = "local",
-    label: str = "profile",
+    label: str = "new",
     run_id: str = "",
     model_path: str = DEFAULT_MODEL,
     prompt: str = DEFAULT_PROMPT,
@@ -819,13 +896,10 @@ def profile_generate(
     width: int = 1024,
     num_inference_steps: int = 20,
     seed: int = 0,
-    profile_all_stages: bool = False,
-    num_profiled_timesteps: int = 5,
-    nsys: bool = False,
     extra_args: str = "",
 ) -> None:
-    """Profile one T2I `sglang generate` run with torch profiler or Nsight."""
-    result = _profile_generate_remote.remote(
+    """Run one `sglang generate` perf dump for SGLang performance reports."""
+    result = _generate_perf_remote.remote(
         source,
         label,
         run_id or _new_run_id(label, source),
@@ -835,9 +909,6 @@ def profile_generate(
         width,
         num_inference_steps,
         seed,
-        profile_all_stages,
-        num_profiled_timesteps,
-        nsys,
         extra_args,
     )
     print(json.dumps(result, indent=2, sort_keys=True))

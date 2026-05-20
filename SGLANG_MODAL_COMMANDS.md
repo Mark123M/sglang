@@ -28,220 +28,173 @@ export HF_TOKEN=hf_...
 ## Local Sanity Checks
 
 ```bash
-python3 -m py_compile scripts/modal/diffusion_dev.py
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench --help
-.venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate --help
+python3 -m py_compile scripts/modal/diffusion_dev.py \
+  python/sglang/multimodal_gen/benchmarks/bench_serving.py
+.venv/bin/modal run scripts/modal/diffusion_dev.py::saturation_bench --help
+.venv/bin/modal run scripts/modal/diffusion_dev.py::generate_perf --help
+
+# Requires a Python env with SGLang benchmark dependencies installed.
+PYTHONPATH=python python3 -m sglang.multimodal_gen.benchmarks.bench_serving --help
 ```
 
-## What's Enabled By Default
+## Silares-Style Saturation Bench
 
-Every `production_bench` run uses a single max-efficiency preset on the H100
-80GB target:
+Closed-loop fixed-concurrency saturation: `bench_serving` receives a full
+backlog (`request-rate=inf`) while `--max-concurrency=N` caps live in-flight
+requests. This mirrors the Silares-style sustained live-concurrency stress
+test.
 
-- `--enable-torch-compile` and `--warmup --warmup-resolutions <workload res>`
-  so the first request does not pay compile cost.
-- `--attention-backend fa` (FlashAttention; lossless).
-- `--batching-mode dynamic` with per-workload `--batching-max-size` and
-  `--batching-delay-ms` (Z-Image-Turbo `8/5ms`, Qwen-Image `4/10ms`,
-  FLUX.1-dev `2/10ms`).
-- VBench prompts, SLO scoring, warmup requests, and a Poisson arrival sweep at
-  concurrency `1,2,4,8`.
-- Cache-DiT env knobs (`SGLANG_CACHE_DIT_ENABLED=true` plus conservative
-  `FN/BN/WARMUP/RDT/MC` defaults). This is the one lossy optimization in the
-  preset; pass `--enable-cache-dit false` for a fully lossless run.
+By default, `saturation_bench` uses the paper-derived
+`diffserve-sdxl-1024-15s` preset: every request without trace-provided `slo_ms`
+gets a fixed `15000 ms` deadline. The summary writes
+`max_concurrent_under_slo`, the largest tier where
+`slo_attainment_rate >= slo-threshold` (default `0.95`).
 
-DiT and VAE offloads stay off because the target GPU has the VRAM headroom and
-copy overlap is unreliable on T2I image models.
+Pass `--fixed-slo-ms <deadline>` to override any preset with a concrete custom
+deadline.
 
-## Dry Run The Production Commands
-
-Prints the exact `sglang serve` and `bench_serving` commands the preset will
-launch, without running anything remote.
+Each run starts `sglang serve` with torch compile, warmup, dynamic batching, and
+the workload's FlashAttention/batching defaults. Cache-DiT is enabled by
+default for throughput; pass `--no-enable-cache-dit` for lossless measurement.
 
 ```bash
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
+export RUN_ID="qwen-saturation-$(date -u +%Y%m%d-%H%M%S)"
+
+.venv/bin/modal run scripts/modal/diffusion_dev.py::saturation_bench \
+  --source local \
+  --run-id "$RUN_ID" \
+  --label qwen-saturation \
+  --workload qwen-image-t2i-prod \
+  --num-prompts 128 \
+  --concurrency 1,2,4,8,16,32,64 \
+  --slo-preset diffserve-sdxl-1024-15s \
+  --slo-threshold 0.95
+```
+
+The sweep stops early at the first tier whose attainment dips below the
+threshold; pass `--no-stop-on-slo-breach` to run every tier. The server-side
+scheduler is still capped at the workload's `--batching-max-size`, so to find
+the true model ceiling raise it:
+`--serve-extra-args "--batching-max-size 16"`.
+
+Dry-run the sweep if you want to confirm the generated `bench_serving` command
+includes `--fixed-slo-ms` before spending GPU time:
+
+```bash
+.venv/bin/modal run scripts/modal/diffusion_dev.py::saturation_bench \
   --dry-run \
   --source local \
   --workload qwen-image-t2i-prod \
-  --num-prompts 20
+  --concurrency 1,2 \
+  --slo-preset diffserve-sdxl-1024-15s
 ```
 
-## Realistic Text-To-Image Workloads
+> Modal parses booleans as click-style flags: use `--enable-cache-dit` /
+> `--no-enable-cache-dit` and `--stop-on-slo-breach` / `--no-stop-on-slo-breach`.
+> Passing `--flag false` errors with "unexpected extra argument (false)".
 
-### Qwen-Image
+### Quick Sana 600M Silares-Style Sweeps
 
-```bash
-export RUN_ID="qwen-image-t2i-$(date -u +%Y%m%d-%H%M%S)"
+Use the smallest supported T2I model when you want fast fixed-SLO saturation
+feedback. These commands borrow the `zimage-turbo-t2i-prod` workload template
+(small-model batching defaults + Cache-DiT env) and override the model,
+resolution, and step count via CLI.
 
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label qwen-image \
-  --workload qwen-image-t2i-prod \
-  --num-prompts 80
-```
-
-### FLUX.1-dev
+Fast strict 3s image SLO:
 
 ```bash
-export RUN_ID="flux1-dev-t2i-$(date -u +%Y%m%d-%H%M%S)"
+export RUN_ID="sana-600m-silares-3s-$(date -u +%Y%m%d-%H%M%S)"
 
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
+.venv/bin/modal run scripts/modal/diffusion_dev.py::saturation_bench \
   --source local \
   --run-id "$RUN_ID" \
-  --label flux1-dev \
-  --workload flux1-dev-t2i-prod \
-  --num-prompts 40
-```
-
-### Z-Image-Turbo
-
-```bash
-export RUN_ID="zimage-turbo-t2i-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label zimage-turbo \
+  --label sana-600m-512-3s \
   --workload zimage-turbo-t2i-prod \
-  --num-prompts 120
+  --model-path Efficient-Large-Model/Sana_600M_512px_diffusers \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 20 \
+  --slo-preset genserve-image-3s \
+  --concurrency 1,2,4,8,16,32,64,128 \
+  --num-prompts 256 \
+  --no-stop-on-slo-breach \
+  --serve-extra-args "--batching-max-size 32 --warmup-resolutions 512x512"
 ```
 
-## Baseline Vs Candidate
-
-Use the same run ID for the baked Docker image baseline and the local checkout
-candidate. Artifacts land together so a side-by-side diff is trivial.
+DiffServe-style 512px 5s SLO:
 
 ```bash
-export RUN_ID="qwen-image-compare-$(date -u +%Y%m%d-%H%M%S)"
+export RUN_ID="sana-600m-silares-5s-$(date -u +%Y%m%d-%H%M%S)"
+
+.venv/bin/modal run scripts/modal/diffusion_dev.py::saturation_bench \
+  --source local \
+  --run-id "$RUN_ID" \
+  --label sana-600m-512-5s \
+  --workload zimage-turbo-t2i-prod \
+  --model-path Efficient-Large-Model/Sana_600M_512px_diffusers \
+  --height 512 \
+  --width 512 \
+  --num-inference-steps 20 \
+  --slo-preset diffserve-t2i-512-5s \
+  --concurrency 1,2,4,8,16,32,64,128 \
+  --num-prompts 256 \
+  --no-stop-on-slo-breach \
+  --serve-extra-args "--batching-max-size 32 --warmup-resolutions 512x512"
 ```
 
+For a tiny first smoke pass, keep the same command and change only:
+`--concurrency 1,2 --num-prompts 16`.
+
+The `--warmup-resolutions 512x512` override is still important: the
+`zimage-turbo-t2i-prod` template warms up at `1024x1024`, but these runs use
+`512x512`. With fixed SLOs, this avoids charging the first 512x512 compile to
+serving latency rather than affecting the SLO deadline itself.
+
+## SGLang Performance Contribution Commands
+
+The SGLang diffusion contributing guide asks for a single-generation
+performance dump before and after a performance-sensitive change:
+
 ```bash
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
+sglang generate \
+  --model-path <model> \
+  --prompt "A benchmark prompt" \
+  --perf-dump-path baseline.json
+
+sglang generate \
+  --model-path <model> \
+  --prompt "A benchmark prompt" \
+  --perf-dump-path new.json
+
+python python/sglang/multimodal_gen/benchmarks/compare_perf.py \
+  baseline.json new.json
+```
+
+Use the Modal helper to run the same flow against the baked image baseline and
+your local checkout candidate:
+
+```bash
+export RUN_ID="qwen-generate-perf-$(date -u +%Y%m%d-%H%M%S)"
+
+.venv/bin/modal run scripts/modal/diffusion_dev.py::generate_perf \
   --source image \
   --run-id "$RUN_ID" \
   --label baseline \
-  --workload qwen-image-t2i-prod \
-  --num-prompts 80
-```
-
-```bash
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label candidate \
-  --workload qwen-image-t2i-prod \
-  --num-prompts 80
-```
-
-## Cache-DiT Off (Lossless Baseline)
-
-Cache-DiT is on by default for throughput. Disable it when comparing against a
-known-good lossless baseline or measuring quality.
-
-```bash
-export RUN_ID="qwen-image-no-cache-dit-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label no-cache-dit \
-  --workload qwen-image-t2i-prod \
-  --enable-cache-dit false \
-  --num-prompts 80
-```
-
-Tune Cache-DiT aggressively (lossier, faster) by setting the env knobs through
-`--serve-extra-args` is not currently supported; override the workload's
-`cache_dit_env` in `scripts/modal/diffusion_dev.py` if you need different
-thresholds.
-
-## Overrides
-
-The preset is opinionated. Reach for `--serve-extra-args` and
-`--bench-extra-args` when you need to override it for one run.
-
-```bash
-# Burst traffic instead of Poisson.
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local --workload qwen-image-t2i-prod --num-prompts 80 \
-  --traffic burst
-```
-
-```bash
-# Wider concurrency sweep.
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local --workload qwen-image-t2i-prod --num-prompts 160 \
-  --concurrency 1,2,4,8,16
-```
-
-```bash
-# Per-tier scheduler batch metrics.
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local --workload qwen-image-t2i-prod --num-prompts 80 \
-  --serve-extra-args "--enable-batching-metrics"
-```
-
-```bash
-# Resolution / steps / model override.
-.venv/bin/modal run scripts/modal/diffusion_dev.py::production_bench \
-  --source local --workload qwen-image-t2i-prod --num-prompts 80 \
-  --model-path Qwen/Qwen-Image --height 768 --width 768 \
-  --num-inference-steps 30
-```
-
-## Profiling Around A Benchmark
-
-Profiling is intentionally separate from production timing runs. Use it after
-the benchmark identifies a workload worth inspecting.
-
-### PyTorch Profiler, Denoising Stage
-
-```bash
-export RUN_ID="qwen-profile-denoise-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label denoise \
   --model-path Qwen/Qwen-Image \
+  --prompt "A benchmark prompt" \
   --height 1024 \
   --width 1024 \
-  --num-inference-steps 20 \
-  --num-profiled-timesteps 5
-```
+  --num-inference-steps 20
 
-### PyTorch Profiler, Full Pipeline
-
-```bash
-export RUN_ID="qwen-profile-full-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate \
+.venv/bin/modal run scripts/modal/diffusion_dev.py::generate_perf \
   --source local \
   --run-id "$RUN_ID" \
-  --label full-pipeline \
+  --label new \
   --model-path Qwen/Qwen-Image \
+  --prompt "A benchmark prompt" \
   --height 1024 \
   --width 1024 \
-  --num-inference-steps 20 \
-  --num-profiled-timesteps 5 \
-  --profile-all-stages
-```
-
-### Nsight Systems
-
-```bash
-export RUN_ID="qwen-profile-nsys-$(date -u +%Y%m%d-%H%M%S)"
-
-.venv/bin/modal run scripts/modal/diffusion_dev.py::profile_generate \
-  --source local \
-  --run-id "$RUN_ID" \
-  --label nsys \
-  --model-path Qwen/Qwen-Image \
-  --height 1024 \
-  --width 1024 \
-  --num-inference-steps 30 \
-  --nsys
+  --num-inference-steps 20
 ```
 
 ## Download And Inspect Artifacts
@@ -254,6 +207,8 @@ mkdir -p modal-runs
 ```bash
 find "modal-runs/$RUN_ID" -maxdepth 2 -type f | sort
 ```
+
+For saturation sweeps:
 
 ```bash
 python3 -m json.tool "modal-runs/$RUN_ID/summary.json"
@@ -282,3 +237,11 @@ PY
 Benchmark JSON files are written under the run directory as one file per
 concurrency tier, for example `qwen-image.c1.json`, `qwen-image.c2.json`,
 `qwen-image.c4.json`, and `qwen-image.c8.json`.
+
+For `generate_perf` runs:
+
+```bash
+python python/sglang/multimodal_gen/benchmarks/compare_perf.py \
+  "modal-runs/$RUN_ID/baseline.perf.json" \
+  "modal-runs/$RUN_ID/new.perf.json"
+```

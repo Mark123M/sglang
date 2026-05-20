@@ -13,6 +13,9 @@ Usage:
 
     # benchmark with SLO metrics enabled
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231 --slo --slo-scale 3.0 --warmup-requests 2
+
+    # benchmark against a concrete paper-style fixed SLO deadline
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231 --slo --fixed-slo-ms 3000
 """
 
 import argparse
@@ -141,6 +144,36 @@ def _populate_slo_ms_from_warmups(
     return updated
 
 
+def _populate_fixed_slo_ms(
+    requests_list: List[RequestFuncInput], fixed_slo_ms: Optional[float]
+) -> List[RequestFuncInput]:
+    """Assign a concrete SLO deadline to requests lacking trace-provided SLOs."""
+    if fixed_slo_ms is None:
+        return requests_list
+
+    fixed_slo_ms = float(fixed_slo_ms)
+    if fixed_slo_ms <= 0:
+        raise ValueError(f"fixed_slo_ms must be positive, got {fixed_slo_ms}.")
+
+    return [
+        req if req.slo_ms is not None else replace(req, slo_ms=fixed_slo_ms)
+        for req in requests_list
+    ]
+
+
+def _populate_slo_ms(
+    requests_list: List[RequestFuncInput], warmup_pairs: List[tuple], args
+) -> List[RequestFuncInput]:
+    if getattr(args, "fixed_slo_ms", None) is not None:
+        return _populate_fixed_slo_ms(requests_list, args.fixed_slo_ms)
+    return _populate_slo_ms_from_warmups(requests_list, warmup_pairs, args)
+
+
+def _mark_slo_achieved(input: RequestFuncInput, output: RequestFuncOutput) -> None:
+    if input.slo_ms is not None and output.success:
+        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+
+
 async def async_request_image_sglang(
     input: RequestFuncInput,
     session: aiohttp.ClientSession,
@@ -231,9 +264,7 @@ async def async_request_image_sglang(
 
     output.latency = time.perf_counter() - output.start_time
 
-    # Check SLO if defined
-    if input.slo_ms is not None and output.success:
-        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+    _mark_slo_achieved(input, output)
 
     if pbar:
         pbar.update(1)
@@ -393,9 +424,7 @@ async def async_request_video_sglang(
 
     output.latency = time.perf_counter() - output.start_time
 
-    # Check SLO if defined
-    if input.slo_ms is not None and output.success:
-        output.slo_achieved = (output.latency * 1000.0) <= input.slo_ms
+    _mark_slo_achieved(input, output)
 
     if pbar:
         pbar.update(1)
@@ -461,6 +490,12 @@ def calculate_metrics(
             {
                 "slo_attainment_rate": slo_attain_all,
                 "slo_met_success": slo_met_success,
+                "slo_mode": (
+                    "fixed"
+                    if getattr(args, "fixed_slo_ms", None) is not None
+                    else "warmup_scaled"
+                ),
+                "fixed_slo_ms": getattr(args, "fixed_slo_ms", None),
                 "slo_scale": getattr(args, "slo_scale", 3.0),
             }
         )
@@ -611,7 +646,7 @@ async def benchmark(args):
 
         # Populate SLO values from warmups if enabled
         if args.slo:
-            requests_list = _populate_slo_ms_from_warmups(
+            requests_list = _populate_slo_ms(
                 requests_list=requests_list, warmup_pairs=warmup_pairs, args=args
             )
 
@@ -688,7 +723,11 @@ async def benchmark(args):
             )
         )
         print("{:<40} {:<15}".format("SLO Met (Success):", metrics["slo_met_success"]))
-        print("{:<40} {:<15.2f}".format("SLO Scale:", metrics["slo_scale"]))
+        print("{:<40} {:<15}".format("SLO Mode:", metrics["slo_mode"]))
+        if metrics["fixed_slo_ms"] is not None:
+            print("{:<40} {:<15.2f}".format("Fixed SLO (ms):", metrics["fixed_slo_ms"]))
+        else:
+            print("{:<40} {:<15.2f}".format("SLO Scale:", metrics["slo_scale"]))
 
     print_divider(60)
 
@@ -814,7 +853,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--slo",
         action="store_true",
-        help="Enable SLO calculation. Uses trace-provided slo_ms or infers from warmups.",
+        help=(
+            "Enable SLO calculation. Uses trace-provided slo_ms, --fixed-slo-ms, "
+            "or infers from warmups."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-slo-ms",
+        type=float,
+        default=None,
+        help=(
+            "Concrete SLO deadline in milliseconds. When set with --slo, this "
+            "is assigned to requests that do not already define slo_ms."
+        ),
     )
     parser.add_argument(
         "--slo-scale",
